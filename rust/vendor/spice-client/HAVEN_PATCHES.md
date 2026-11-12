@@ -254,6 +254,15 @@ structs that ARE read live (`SpiceMsgSurfaceCreate/Destroy`, `SpiceMonitorsConfi
 - **SPICE ACK flow control** (`display.rs`): the channel sent only `ACK_SYNC` on
   `SET_ACK`, never the periodic `MSGC_ACK`. Now parses the `window` and acks every
   `window` messages (necessary, though not sufficient — see below).
+- **60 Hz primary-surface frame coalescing + off-screen surface guard** (`display.rs`,
+  #607): `notify_update` now ignores off-screen `surface_id != 0` pixmap surfaces (and
+  `DisplayChannelMessage::Mark` notifies primary surface `0` rather than an arbitrary
+  `HashMap` key), and `DisplayChannel::run` marks `primary_dirty` on individual
+  `DRAW_*`/`COPY_BITS` paints instead of invoking `update_callback` per rect, flushing
+  at most once per 16 ms (~60 Hz) with a pinned `&mut read_fut` inside `tokio::select!`
+  so trailing-edge flushes never drop partially-read SPICE frames. Verified by two
+  loopback TCP unit tests (`burst_of_draws_coalesces_callbacks_and_preserves_split_packet_across_flush`,
+  `offscreen_surface_updates_and_mark_never_emit_non_primary_surface`; 100 crate tests green).
 - **`SpiceRect` test** (`protocol/tests.rs`): updated to assert the corrected
   `{top,left,bottom,right}` wire order.
 

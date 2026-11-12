@@ -100,6 +100,11 @@ pub struct DisplayChannel {
     // first window (only the initial paint arrives). 0 = no acking negotiated.
     ack_window: u32,
     ack_count: u32,
+    // #607: while `run()` is active, individual DRAW_*/COPY_BITS messages mark
+    // `primary_dirty` instead of invoking `update_callback` per rect, flushing
+    // at most once per 16 ms (~60 Hz) with a cancellation-safe trailing edge.
+    coalesce_updates: bool,
+    primary_dirty: bool,
 }
 
 impl DisplayChannel {
@@ -188,6 +193,8 @@ impl DisplayChannel {
             glz_window: HashMap::new(),
             ack_window: 0,
             ack_count: 0,
+            coalesce_updates: false,
+            primary_dirty: false,
         })
     }
 
@@ -271,6 +278,8 @@ impl DisplayChannel {
             glz_window: HashMap::new(),
             ack_window: 0,
             ack_count: 0,
+            coalesce_updates: false,
+            primary_dirty: false,
         })
     }
 
@@ -357,6 +366,8 @@ impl DisplayChannel {
             glz_window: HashMap::new(),
             ack_window: 0,
             ack_count: 0,
+            coalesce_updates: false,
+            primary_dirty: false,
         })
     }
 
@@ -420,9 +431,26 @@ impl DisplayChannel {
         self.handle_message(&header, &data).await
     }
 
-    fn notify_update(&self, surface_id: u32) {
+    fn notify_update(&mut self, surface_id: u32) {
+        // #607: only surface 0 is the visible primary desktop framebuffer.
+        // Off-screen QXL surfaces (surface_id != 0) are backing pixmaps and
+        // must never overwrite the viewer's frame.
+        if surface_id != 0 {
+            return;
+        }
+        if self.coalesce_updates {
+            if self.surfaces.contains_key(&0) {
+                self.primary_dirty = true;
+            }
+            return;
+        }
+        self.emit_primary_update();
+    }
+
+    fn emit_primary_update(&mut self) {
+        self.primary_dirty = false;
         if let Some(ref callback) = self.update_callback {
-            if let Some(surface) = self.surfaces.get(&surface_id) {
+            if let Some(surface) = self.surfaces.get(&0) {
                 callback(surface);
             }
         }
@@ -1302,14 +1330,46 @@ impl DisplayChannel {
         Ok(Some((decompressed, width, height)))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn run(&mut self) -> Result<()> {
+        const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
         info!(
             "DisplayChannel: Starting event loop for channel {}",
             self.connection.channel_id
         );
         debug!("DisplayChannel: Entering message read loop");
-        loop {
-            match self.connection.read_message().await {
+
+        self.coalesce_updates = true;
+        self.primary_dirty = false;
+        let mut next_flush_deadline = tokio::time::Instant::now();
+
+        let result = loop {
+            // Pin a single `read_message()` future per wire frame and poll `&mut read_fut`
+            // inside `select!` so a trailing-edge 16 ms flush never drops a partially-read
+            // SPICE header or body from `ChannelConnection::read_message` (#607).
+            let read_res = {
+                let mut read_fut = std::pin::pin!(self.connection.read_message());
+                loop {
+                    let dirty = self.primary_dirty;
+                    let deadline = next_flush_deadline;
+                    tokio::select! {
+                        biased;
+                        res = &mut read_fut => break res,
+                        _ = tokio::time::sleep_until(deadline), if dirty => {
+                            self.primary_dirty = false;
+                            if let (Some(ref callback), Some(surface)) =
+                                (&self.update_callback, self.surfaces.get(&0))
+                            {
+                                callback(surface);
+                            }
+                            next_flush_deadline = tokio::time::Instant::now() + MIN_FRAME_INTERVAL;
+                        }
+                    }
+                }
+            };
+
+            match read_res {
                 Ok((header, data)) => {
                     // HAVEN: a single message's parse/decode failure must NOT
                     // tear down the channel. The display task is spawned and its
@@ -1324,6 +1384,50 @@ impl DisplayChannel {
                     }
                     // SPICE ACK flow control: replenish the server's send window
                     // every `ack_window` messages, else it stalls after one window.
+                    if self.ack_window > 0 {
+                        self.ack_count = self.ack_count.saturating_sub(1);
+                        if self.ack_count == 0 {
+                            self.ack_count = self.ack_window;
+                            if let Err(e) = self.connection.send_message(2, &[]).await {
+                                break Err(e);
+                            }
+                        }
+                    }
+                    if self.primary_dirty && tokio::time::Instant::now() >= next_flush_deadline {
+                        self.emit_primary_update();
+                        next_flush_deadline = tokio::time::Instant::now() + MIN_FRAME_INTERVAL;
+                    }
+                }
+                Err(e) => {
+                    if self.primary_dirty {
+                        self.emit_primary_update();
+                    }
+                    debug!("DisplayChannel: Error reading message: {e}");
+                    break Err(e);
+                }
+            }
+        };
+
+        self.coalesce_updates = false;
+        result
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn run(&mut self) -> Result<()> {
+        info!(
+            "DisplayChannel: Starting event loop for channel {}",
+            self.connection.channel_id
+        );
+        debug!("DisplayChannel: Entering message read loop");
+        loop {
+            match self.connection.read_message().await {
+                Ok((header, data)) => {
+                    if let Err(e) = self.handle_message(&header, &data).await {
+                        warn!(
+                            "DisplayChannel: handling msg type {} failed: {e} — skipping",
+                            header.msg_type
+                        );
+                    }
                     if self.ack_window > 0 {
                         self.ack_count = self.ack_count.saturating_sub(1);
                         if self.ack_count == 0 {
@@ -1630,9 +1734,9 @@ impl Channel for DisplayChannel {
                 self.last_mark = Some(mark);
 
                 // According to the protocol, we should expose the display content after receiving a mark
-                // Notify any update callbacks about the current surface state
-                if let Some(surface_id) = self.surfaces.keys().next() {
-                    self.notify_update(*surface_id);
+                // Notify any update callbacks about the current primary surface state
+                if self.surfaces.contains_key(&0) {
+                    self.notify_update(0);
                 }
 
                 // The MARK message itself doesn't require a specific acknowledgment response
@@ -1642,6 +1746,7 @@ impl Channel for DisplayChannel {
                 debug!("Received display reset");
                 // Reset display state - clear all surfaces and streams
                 self.surfaces.clear();
+                self.primary_dirty = false;
                 self.active_streams.clear();
                 self.monitors.clear();
             }
@@ -1767,6 +1872,9 @@ impl Channel for DisplayChannel {
                 info!("Destroying surface {}", surface_destroy.surface_id);
 
                 self.surfaces.remove(&surface_destroy.surface_id);
+                if surface_destroy.surface_id == 0 {
+                    self.primary_dirty = false;
+                }
             }
             x if x == SPICE_MSG_DISPLAY_MONITORS_CONFIG => {
                 debug!("Received monitors config");
@@ -2787,6 +2895,194 @@ mod tests {
         assert_eq!(parsed.str_, 0x4000);
         assert_eq!(parsed.fore_brush.color, 0x000000);
         assert_eq!(parsed.back_brush.color, 0xFFFFFF);
+    }
+
+    fn encode_wire_packet(serial: u64, msg_type: u16, body: &[u8]) -> Vec<u8> {
+        let header = SpiceDataHeader {
+            serial,
+            msg_type,
+            msg_size: body.len() as u32,
+            sub_list: 0,
+        };
+        let mut out = Vec::with_capacity(18 + body.len());
+        header.write(&mut Cursor::new(&mut out)).unwrap();
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn encode_draw_fill_body(surface_id: u32, rgb: u32) -> Vec<u8> {
+        let mut d = Vec::with_capacity(31);
+        d.extend_from_slice(&surface_id.to_le_bytes());
+        for v in [0i32, 0, 4, 4] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.push(ClipType::None as u8);
+        d.extend_from_slice(&(BrushType::Solid as u32).to_le_bytes());
+        d.extend_from_slice(&rgb.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes()); // PUT rop
+        d
+    }
+
+    async fn loopback_display_channel(width: u32, height: u32) -> (tokio::net::TcpStream, DisplayChannel) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let connection = ChannelConnection::new("127.0.0.1", port, ChannelType::Display, 0)
+            .await
+            .unwrap();
+        let server_stream = accept_task.await.unwrap();
+
+        let mut surfaces = HashMap::new();
+        surfaces.insert(
+            0,
+            DisplaySurface {
+                width,
+                height,
+                format: 32,
+                data: vec![0u8; (width * height * 4) as usize],
+            },
+        );
+        let channel = DisplayChannel {
+            connection,
+            surfaces,
+            monitors: Vec::new(),
+            active_streams: HashMap::new(),
+            update_callback: None,
+            image_cache: ImageCache::new(),
+            last_mark: None,
+            glz_window: HashMap::new(),
+            ack_window: 0,
+            ack_count: 0,
+            coalesce_updates: false,
+            primary_dirty: false,
+        };
+        (server_stream, channel)
+    }
+
+    #[tokio::test]
+    async fn burst_of_draws_coalesces_callbacks_and_preserves_split_packet_across_flush() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut channel) = loopback_display_channel(16, 16).await;
+        let frames_emitted = Arc::new(AtomicUsize::new(0));
+        let last_pixel = Arc::new(Mutex::new([0u8; 4]));
+
+        let frames_cb = frames_emitted.clone();
+        let pixel_cb = last_pixel.clone();
+        channel.set_update_callback(move |surface: &DisplaySurface| {
+            frames_cb.fetch_add(1, Ordering::SeqCst);
+            let mut px = pixel_cb.lock().unwrap();
+            px.copy_from_slice(&surface.data[0..4]);
+        });
+
+        let run_task = tokio::spawn(async move { channel.run().await });
+
+        // Send 50 back-to-back DrawFill messages on primary surface 0. Without
+        // coalescing (#607) this fired 50 full-surface callbacks; with 16 ms
+        // coalescing it emits a leading frame (#1) plus a trailing frame (#50).
+        let mut burst = Vec::new();
+        for i in 1..=50u32 {
+            let color = (i << 16) | 0x003456;
+            let body = encode_draw_fill_body(0, color);
+            burst.extend_from_slice(&encode_wire_packet(i as u64, DisplayChannelMessage::DrawFill as u16, &body));
+        }
+
+        // Split packet #51 mid-header (5 of 18 header bytes) BEFORE sleeping past
+        // the 16 ms flush deadline so the trailing-edge flush runs while
+        // `read_message` is suspended mid-header. A non-cancellation-safe
+        // `select!` would lose those 5 bytes and corrupt framing.
+        let split_pkt = encode_wire_packet(
+            51,
+            DisplayChannelMessage::DrawFill as u16,
+            &encode_draw_fill_body(0, 0x00abcdef),
+        );
+        burst.extend_from_slice(&split_pkt[..5]);
+        server.write_all(&burst).await.unwrap();
+        server.flush().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        assert_eq!(
+            *last_pixel.lock().unwrap(),
+            [50, 0x34, 0x56, 255],
+            "trailing-edge 16 ms flush must deliver the 50th draw while #51 is mid-header",
+        );
+
+        // Complete packet #51 and close cleanly.
+        server.write_all(&split_pkt[5..]).await.unwrap();
+        server.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drop(server);
+
+        let _ = run_task.await.unwrap();
+        let count = frames_emitted.load(Ordering::SeqCst);
+        assert!(
+            (2..=5).contains(&count),
+            "expected 51 draws to coalesce into 2..=5 frame callbacks, got {count}",
+        );
+        assert_eq!(
+            *last_pixel.lock().unwrap(),
+            [0xab, 0xcd, 0xef, 255],
+            "split packet #51 must decode intact after the mid-header timer flush",
+        );
+    }
+
+    #[tokio::test]
+    async fn offscreen_surface_updates_and_mark_never_emit_non_primary_surface() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut channel) = loopback_display_channel(16, 16).await;
+        let seen_sizes: Arc<Mutex<Vec<(u32, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen_sizes.clone();
+        channel.set_update_callback(move |surface: &DisplaySurface| {
+            seen_cb.lock().unwrap().push((surface.width, surface.height));
+        });
+
+        let run_task = tokio::spawn(async move { channel.run().await });
+
+        // Create off-screen surface 1 (8x8) and draw into it: neither must emit.
+        let mut sc_body = Vec::new();
+        SpiceMsgSurfaceCreate {
+            surface_id: 1,
+            width: 8,
+            height: 8,
+            format: 32,
+            flags: 0,
+        }
+        .write(&mut Cursor::new(&mut sc_body))
+        .unwrap();
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&encode_wire_packet(1, SPICE_MSG_DISPLAY_SURFACE_CREATE, &sc_body));
+        wire.extend_from_slice(&encode_wire_packet(
+            2,
+            DisplayChannelMessage::DrawFill as u16,
+            &encode_draw_fill_body(1, 0x00ff0000),
+        ));
+        server.write_all(&wire).await.unwrap();
+        server.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            seen_sizes.lock().unwrap().is_empty(),
+            "off-screen surface_id != 0 must never trigger the primary framebuffer callback",
+        );
+
+        // Now send Mark with both surfaces {0, 1} in the map -> must emit surface 0 (16x16).
+        server
+            .write_all(&encode_wire_packet(3, DisplayChannelMessage::Mark as u16, &1u32.to_le_bytes()))
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drop(server);
+
+        let _ = run_task.await.unwrap();
+        let sizes = seen_sizes.lock().unwrap().clone();
+        assert_eq!(sizes, vec![(16, 16)]);
     }
 }
 
