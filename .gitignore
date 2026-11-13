@@ -1,2 +1,8 @@
+build/
+.gradle/
+.kotlin/
+*.iml
+.idea/
+local.properties
 /rust/target/
 /rust/vendor/spice-client/target/

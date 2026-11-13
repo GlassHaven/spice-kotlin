@@ -3,7 +3,7 @@
 #
 # Prerequisites:
 #   cargo install cargo-ndk
-#   rustup target add aarch64-linux-android x86_64-linux-android
+#   rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi
 #   ANDROID_NDK_HOME set (or detected from ~/Android/Sdk/ndk/*)
 
 set -euo pipefail
